@@ -1,6 +1,4 @@
 import pandas as pd
-#print(trips.dtypes)
-import pandas as pd
 
 
 class TaxiDataProcessor:
@@ -19,6 +17,8 @@ class TaxiDataProcessor:
             'payment_type': '支付方式'
         }
         self.removal_stats = {}
+        self.peak_hours = None
+        self.hour_counts = None
 
     def check_data(self):
         core_fields = {
@@ -102,8 +102,8 @@ class TaxiDataProcessor:
         for k, v in payment_counts.items():
             print(f"  {k}: {v:,} ({(v / len(self.df) * 100):.1f}%)")
 
-    def clean(self):#清洗数据策略：缺失值用平均数来填充，异常值直接删除
-        print("=" * 60)
+    def clean(self):  # 清洗数据策略：缺失值用平均数来填充，异常值直接删除
+        print("\n" + "=" * 60)
         print("开始数据清洗")
         print("=" * 60)
         print(f"清洗前记录数: {len(self.df):,}")
@@ -113,7 +113,7 @@ class TaxiDataProcessor:
         duration_hours = (self.df['tpep_dropoff_datetime'] - self.df['tpep_pickup_datetime']).dt.total_seconds() / 3600
 
         # 记录各类异常删除数量
-        anomaly_stats = {}  # 改为英文变量名
+        anomaly_stats = {}
 
         # 1. 删除行程时长异常
         mask_duration = (duration_hours >= 0) & (duration_hours <= 24)
@@ -178,23 +178,118 @@ class TaxiDataProcessor:
 
     def get_removal_stats(self):
         """获取删除统计信息"""
-
         return self.removal_stats
 
+    def extract_time_features(self):
+        """提取时间特征"""
+        print("\n" + "=" * 60)
+        print("提取时间特征")
+        print("=" * 60)
+
+        pickup = self.df['tpep_pickup_datetime']
+        dropoff = self.df['tpep_dropoff_datetime']
+
+        # 基础时间特征
+        self.df['pickup_hour'] = pickup.dt.hour
+        self.df['pickup_weekday'] = pickup.dt.dayofweek
+        self.df['is_weekend'] = (pickup.dt.dayofweek >= 5).astype(int)
+
+        # 行程时长
+        duration_hours = (dropoff - pickup).dt.total_seconds() / 3600
+        self.df['trip_duration_hours'] = duration_hours
+        self.df['trip_duration_minutes'] = duration_hours * 60
+
+        # 平均速度
+        self.df['avg_speed_mph'] = 0.0
+        mask = self.df['trip_duration_hours'] > 0.01
+        self.df.loc[mask, 'avg_speed_mph'] = self.df.loc[mask, 'trip_distance'] / self.df.loc[
+            mask, 'trip_duration_hours']
+        self.df.loc[self.df['avg_speed_mph'] > 100, 'avg_speed_mph'] = 100
+
+        # 收入时间密度
+        self.df['revenue_density_per_hour'] = 0.0
+        self.df.loc[mask, 'revenue_density_per_hour'] = self.df.loc[mask, 'total_amount'] / self.df.loc[
+            mask, 'trip_duration_hours']
+
+        print(
+            f"已添加特征: pickup_hour, pickup_weekday, is_weekend, trip_duration_hours, avg_speed_mph, revenue_density_per_hour")
+        print("=" * 60)
+
+        return self.df
+
+    def detect_peak_hours(self):
+        """基于已有数据进行高峰时段的提取，取行程量最高的两个小时作为高峰时段"""
+        print("\n" + "=" * 60)
+        print("高峰时段提取")
+        print("=" * 60)
+
+        # 统计每个小时的行程数（基于上车时间）
+        hour_counts = self.df['pickup_hour'].value_counts().sort_index()
+
+        # 补充缺失的小时
+        for h in range(24):
+            if h not in hour_counts.index:
+                hour_counts[h] = 0
+        hour_counts = hour_counts.sort_index()
+
+        # 打印各小时行程数分布
+        print(f"\n各小时行程数统计:")
+        max_count = hour_counts.max()
+        for hour in range(24):
+            count = hour_counts[hour]
+            bar_len = int(count / max_count * 40)
+            bar = '█' * bar_len
+            print(f"  {hour:2d}时: {count:8,} {bar}")
+
+        # 找出最高的两个小时
+        top2 = hour_counts.nlargest(2)
+        peak_hours = top2.index.tolist()
+        peak_counts = top2.values.tolist()
+
+        print(f"\n最高两个高峰时段:")
+        for i, (hour, count) in enumerate(zip(peak_hours, peak_counts), 1):
+            print(f"  第{i}名: {hour:2d}:00 - {hour + 1:2d}:00, 行程数: {count:,}")
+
+        # 存储结果
+        self.peak_hours = peak_hours
+        self.hour_counts = hour_counts.to_dict()
+
+        print("=" * 60)
+
+        return peak_hours
+
+
 def main():
-    # 初始化
+    # 读取数据
     trips = pd.read_parquet('yellow_tripdata_2023-01.parquet')
+
+    # 初始化处理器
     processor = TaxiDataProcessor(trips)
 
-    # 检查和清洗
-    processor.check_data()  # 生成报告
-    processor.clean()  # 清洗数据
+    # 1. 检查数据质量
+    processor.check_data()
 
-    # 获取结果
-    trips_clean = processor.get_cleaned_data()
+    # 2. 清洗数据
+    processor.clean()
 
-    print(f"\n原始数据: {len(trips)} 条")
-    print(f"清洗后: {len(trips_clean)} 条")
+    # 3. 提取时间特征
+    processor.extract_time_features()
+
+    # 4. 检测高峰时段
+    processor.detect_peak_hours()
+
+    # 5. 设置高峰标识
+    processor.df['is_peak_hour'] = processor.df['pickup_hour'].isin(processor.peak_hours).astype(int)
+
+    # 6. 获取最终数据
+    trips_processed = processor.get_cleaned_data()
+
+    print(f"\n最终数据形状: {trips_processed.shape}")
+    print(
+        f"高峰时段: {processor.peak_hours[0]}:00-{processor.peak_hours[0] + 1}:00 和 {processor.peak_hours[1]}:00-{processor.peak_hours[1] + 1}:00")
+    print(f"\n处理完成！")
+
+    return processor
 
 
 if __name__ == "__main__":
