@@ -8,11 +8,362 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+import seaborn as sns
 import os
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
+
+class TaxiDemandPredictor:
+    """出租车出行需求量预测类"""
+
+    def __init__(self, processor):
+        """
+        初始化预测器
+
+        Parameters:
+        -----------
+        processor : TaxiDataProcessor
+            已处理好的数据处理器对象
+        """
+        self.df = processor.get_cleaned_data()
+        self.peak_hours = processor.peak_hours if hasattr(processor, 'peak_hours') else [17, 18]
+
+        # 创建输出目录
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+
+    def prepare_data(self, target_region=None):
+        """
+        准备训练数据
+
+        Parameters:
+        -----------
+        target_region : int
+            目标区域ID，如果为None则选择客流量最高的区域
+        """
+        df = self.df
+
+        # 选择目标区域（客流量最高的区域）
+        if target_region is None:
+            top_regions = df['PULocationID'].value_counts().head(1).index.tolist()
+            target_region = top_regions[0]
+
+        self.target_region = target_region
+        print(f"\n目标区域: {target_region}")
+
+        # 筛选目标区域的数据
+        region_df = df[df['PULocationID'] == target_region].copy()
+
+        # 按小时聚合订单量
+        # 创建完整的时间索引（24小时 x 7天）
+        region_df['date'] = region_df['tpep_pickup_datetime'].dt.date
+        region_df['hour'] = region_df['pickup_hour']
+        region_df['weekday'] = region_df['pickup_weekday']
+        region_df['is_weekend'] = region_df['is_weekend']
+
+        # 聚合：按日期、小时统计订单量
+        demand_agg = region_df.groupby(['date', 'hour', 'weekday', 'is_weekend']).size().reset_index(name='demand')
+
+        # 创建滞后特征（前1小时、前2小时、前24小时的需求量）
+        demand_agg = demand_agg.sort_values(['date', 'hour'])
+
+        # 滞后特征
+        demand_agg['lag_1'] = demand_agg.groupby('hour')['demand'].shift(1)
+        demand_agg['lag_2'] = demand_agg.groupby('hour')['demand'].shift(2)
+        demand_agg['lag_24'] = demand_agg.groupby('hour')['demand'].shift(24)
+
+        # 滚动平均特征
+        demand_agg['rolling_mean_3'] = demand_agg.groupby('hour')['demand'].transform(
+            lambda x: x.rolling(3, min_periods=1).mean()
+        )
+
+        # 删除缺失值
+        demand_agg = demand_agg.dropna()
+
+        # 特征工程
+        # 时间特征
+        demand_agg['hour_sin'] = np.sin(2 * np.pi * demand_agg['hour'] / 24)
+        demand_agg['hour_cos'] = np.cos(2 * np.pi * demand_agg['hour'] / 24)
+        demand_agg['weekday_sin'] = np.sin(2 * np.pi * demand_agg['weekday'] / 7)
+        demand_agg['weekday_cos'] = np.cos(2 * np.pi * demand_agg['weekday'] / 7)
+
+        # 高峰时段标识
+        demand_agg['is_peak'] = demand_agg['hour'].isin(self.peak_hours).astype(int)
+
+        # 定义特征列
+        feature_cols = ['hour', 'weekday', 'is_weekend', 'is_peak',
+                        'hour_sin', 'hour_cos', 'weekday_sin', 'weekday_cos',
+                        'lag_1', 'lag_2', 'lag_24', 'rolling_mean_3']
+
+        X = demand_agg[feature_cols]
+        y = demand_agg['demand'].values
+
+        print(f"数据集大小: {len(X)} 条记录")
+        print(f"特征数量: {len(feature_cols)}")
+        print(f"平均每小时需求量: {y.mean():.2f}")
+
+        return X, y, feature_cols
+
+    def build_neural_network(self, input_dim):
+        """构建神经网络模型"""
+
+        model = keras.Sequential([
+            layers.Input(shape=(input_dim,)),
+            layers.Dense(128, activation='relu'),
+            layers.Dropout(0.2),
+            layers.Dense(64, activation='relu'),
+            layers.Dropout(0.2),
+            layers.Dense(32, activation='relu'),
+            layers.Dense(16, activation='relu'),
+            layers.Dense(1, activation='linear')
+        ])
+
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae']
+        )
+
+        return model
+
+    def train_neural_network(self, X_train, X_test, y_train, y_test):
+        """训练神经网络模型"""
+
+        print("\n" + "=" * 60)
+        print("神经网络模型训练")
+        print("=" * 60)
+
+        # 标准化
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        # 构建模型
+        model = self.build_neural_network(X_train.shape[1])
+        print(model.summary())
+
+        # 早停回调
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=20,
+            restore_best_weights=True
+        )
+
+        # 训练模型
+        history = model.fit(
+            X_train_scaled, y_train,
+            epochs=100,
+            batch_size=32,
+            validation_split=0.2,
+            callbacks=[early_stopping],
+            verbose=1
+        )
+
+        # 预测
+        y_pred_nn = model.predict(X_test_scaled).flatten()
+
+        # 评估
+        mae_nn = mean_absolute_error(y_test, y_pred_nn)
+        rmse_nn = np.sqrt(mean_squared_error(y_test, y_pred_nn))
+
+        print(f"\n神经网络模型评估:")
+        print(f"  MAE: {mae_nn:.4f}")
+        print(f"  RMSE: {rmse_nn:.4f}")
+
+        # 绘制loss曲线
+        self.plot_loss_curve(history)
+
+        return model, scaler, y_pred_nn, mae_nn, rmse_nn
+
+    def train_random_forest(self, X_train, X_test, y_train, y_test):
+        """训练随机森林模型"""
+
+        print("\n" + "=" * 60)
+        print("随机森林模型训练")
+        print("=" * 60)
+
+        # 训练模型
+        rf = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=15,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1
+        )
+
+        rf.fit(X_train, y_train)
+
+        # 预测
+        y_pred_rf = rf.predict(X_test)
+
+        # 评估
+        mae_rf = mean_absolute_error(y_test, y_pred_rf)
+        rmse_rf = np.sqrt(mean_squared_error(y_test, y_pred_rf))
+
+        print(f"随机森林模型评估:")
+        print(f"  MAE: {mae_rf:.4f}")
+        print(f"  RMSE: {rmse_rf:.4f}")
+
+        # 特征重要性
+        feature_importance = pd.DataFrame({
+            'feature': X_train.columns,
+            'importance': rf.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+        print("\n特征重要性 TOP5:")
+        for _, row in feature_importance.head(5).iterrows():
+            print(f"  {row['feature']}: {row['importance']:.4f}")
+
+        return rf, y_pred_rf, mae_rf, rmse_rf, feature_importance
+
+    def plot_loss_curve(self, history):
+        """绘制训练损失曲线"""
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        ax.plot(history.history['loss'], label='训练损失', linewidth=2)
+        ax.plot(history.history['val_loss'], label='验证损失', linewidth=2)
+
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss (MSE)', fontsize=12)
+        ax.set_title('神经网络训练损失曲线', fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig('outputs/nn_loss_curve.png', dpi=300)
+        print(f"\n损失曲线已保存至: outputs/nn_loss_curve.png")
+        plt.show()
+
+        return fig
+
+    def plot_comparison(self, y_test, y_pred_nn, y_pred_rf):
+        """绘制模型对比图"""
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle('神经网络 vs 随机森林 预测对比', fontsize=14, fontweight='bold')
+
+        # 子图1：预测值 vs 真实值散点图
+        ax1 = axes[0]
+        ax1.scatter(y_test, y_pred_nn, alpha=0.3, s=10, c='blue', label='神经网络')
+        ax1.scatter(y_test, y_pred_rf, alpha=0.3, s=10, c='red', label='随机森林')
+        ax1.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'k--', lw=2, label='理想线')
+        ax1.set_xlabel('真实需求量', fontsize=12)
+        ax1.set_ylabel('预测需求量', fontsize=12)
+        ax1.set_title('预测值 vs 真实值', fontsize=12, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # 子图2：残差分布箱线图
+        ax2 = axes[1]
+        residual_nn = y_test - y_pred_nn
+        residual_rf = y_test - y_pred_rf
+
+        bp = ax2.boxplot([residual_nn, residual_rf],
+                         labels=['神经网络', '随机森林'],
+                         patch_artist=True)
+        bp['boxes'][0].set_facecolor('lightblue')
+        bp['boxes'][1].set_facecolor('lightcoral')
+        ax2.axhline(y=0, color='black', linestyle='--', linewidth=1.5)
+        ax2.set_xlabel('模型', fontsize=12)
+        ax2.set_ylabel('残差', fontsize=12)
+        ax2.set_title('残差分布对比', fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plt.savefig('outputs/model_comparison.png', dpi=300)
+        print(f"模型对比图已保存至: outputs/model_comparison.png")
+        plt.show()
+
+        return fig
+
+    def run_experiment(self, target_region=None):
+        """运行完整实验"""
+
+        print("\n" + "=" * 60)
+        print("出行需求量预测实验")
+        print("=" * 60)
+
+        # 准备数据
+        X, y, feature_cols = self.prepare_data(target_region)
+
+        # 划分训练集和测试集 (8:2)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, shuffle=False
+        )
+
+        print(f"\n训练集大小: {len(X_train)}")
+        print(f"测试集大小: {len(X_test)}")
+
+        # 训练神经网络
+        nn_model, scaler, y_pred_nn, mae_nn, rmse_nn = self.train_neural_network(
+            X_train, X_test, y_train, y_test
+        )
+
+        # 训练随机森林
+        rf_model, y_pred_rf, mae_rf, rmse_rf, feature_importance = self.train_random_forest(
+            X_train, X_test, y_train, y_test
+        )
+
+        # 绘制对比图
+        self.plot_comparison(y_test, y_pred_nn, y_pred_rf)
+
+        # 结果汇总
+        print("\n" + "=" * 60)
+        print("实验结果汇总")
+        print("=" * 60)
+
+        results = pd.DataFrame({
+            '模型': ['神经网络', '随机森林'],
+            'MAE': [mae_nn, mae_rf],
+            'RMSE': [rmse_nn, rmse_rf]
+        })
+        print(results.to_string(index=False))
+
+        # 优劣分析
+        print("\n" + "=" * 60)
+        print("模型优劣分析")
+        print("=" * 60)
+
+        if mae_nn < mae_rf:
+            print(f"✅ 神经网络 MAE 优于随机森林 {abs(mae_nn - mae_rf):.4f}")
+        else:
+            print(f"✅ 随机森林 MAE 优于神经网络 {abs(mae_nn - mae_rf):.4f}")
+
+        if rmse_nn < rmse_rf:
+            print(f"✅ 神经网络 RMSE 优于随机森林 {abs(rmse_nn - rmse_rf):.4f}")
+        else:
+            print(f"✅ 随机森林 RMSE 优于神经网络 {abs(rmse_nn - rmse_rf):.4f}")
+
+        print("\n【神经网络优势】")
+        print("  - 能够学习复杂的非线性关系")
+        print("  - 更适合大规模数据")
+        print("  - 可以捕捉时间序列的长期依赖")
+
+        print("\n【随机森林优势】")
+        print("  - 不需要数据标准化")
+        print("  - 训练速度快，可解释性强")
+        print("  - 对异常值鲁棒性更好")
+        print("  - 特征重要性可解释")
+
+        print("\n【建议】")
+        if len(X_train) > 10000:
+            print("  - 数据量较大，推荐使用神经网络")
+        else:
+            print("  - 数据量中等，随机森林可能表现更好")
+
+        return {
+            'nn_mae': mae_nn,
+            'nn_rmse': rmse_nn,
+            'rf_mae': mae_rf,
+            'rf_rmse': rmse_rf,
+            'nn_model': nn_model,
+            'rf_model': rf_model,
+            'feature_importance': feature_importance
+        }
 class TaxiDataProcessor:
 
     def __init__(self, df):
@@ -848,7 +1199,6 @@ def main():
     # 6. 获取最终数据
     trips_processed = processor.get_cleaned_data()
 
-    print(f"\n最终数据形状: {trips_processed.shape}")
     print(
         f"高峰时段: {processor.peak_hours[0]}:00-{processor.peak_hours[0] + 1}:00 和 {processor.peak_hours[1]}:00-{processor.peak_hours[1] + 1}:00")
     print(f"\n处理完成！")
@@ -862,7 +1212,11 @@ def main():
     # 绘制平均速度因素分析图
     processor.plot_speed_analysis()
 
-    return processor
+    # 预测
+    predictor = TaxiDemandPredictor(processor)
+    results = predictor.run_experiment()
+
+    return processor, predictor, results
 
 
 if __name__ == "__main__":
