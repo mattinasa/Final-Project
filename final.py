@@ -1,5 +1,4 @@
 import pandas as pd
-df = pd.read_parquet('yellow_tripdata_2023-01.parquet')
 #print(trips.dtypes)
 import pandas as pd
 
@@ -102,3 +101,101 @@ class TaxiDataProcessor:
         payment_counts = self.df['payment_type'].map(payment_map).value_counts()
         for k, v in payment_counts.items():
             print(f"  {k}: {v:,} ({(v / len(self.df) * 100):.1f}%)")
+
+    def clean(self):#清洗数据策略：缺失值用平均数来填充，异常值直接删除
+        print("=" * 60)
+        print("开始数据清洗")
+        print("=" * 60)
+        print(f"清洗前记录数: {len(self.df):,}")
+
+        before = len(self.df)
+
+        duration_hours = (self.df['tpep_dropoff_datetime'] - self.df['tpep_pickup_datetime']).dt.total_seconds() / 3600
+
+        # 记录各类异常删除数量
+        anomaly_stats = {}  # 改为英文变量名
+
+        # 1. 删除行程时长异常
+        mask_duration = (duration_hours >= 0) & (duration_hours <= 24)
+        anomaly_stats['行程时长异常'] = (~mask_duration).sum()
+        self.df = self.df[mask_duration]
+
+        # 2. 删除行程距离异常
+        mask_distance = (self.df['trip_distance'] > 0) & (self.df['trip_distance'] <= 100)
+        anomaly_stats['行程距离异常'] = (~mask_distance).sum()
+        self.df = self.df[mask_distance]
+
+        # 3. 删除乘客人数异常
+        mask_passenger_abnormal = (self.df['passenger_count'] < 1) | (self.df['passenger_count'] > 6)
+        anomaly_stats['乘客人数异常'] = mask_passenger_abnormal.sum()
+        self.df = self.df[~mask_passenger_abnormal]
+
+        # 4. 删除车费金额异常
+        mask_fare = (self.df['fare_amount'] >= 0) & (self.df['fare_amount'] <= 200)
+        anomaly_stats['车费金额异常'] = (~mask_fare).sum()
+        self.df = self.df[mask_fare]
+
+        # 5. 删除支付方式异常
+        mask_payment = self.df['payment_type'].isin([1, 2, 3, 4, 5, 6])
+        anomaly_stats['支付方式异常'] = (~mask_payment).sum()
+        self.df = self.df[mask_payment]
+
+        # 处理缺失值（用正常数据的平均值填充）
+        mean_passenger = self.df['passenger_count'].mean()
+        missing_passenger = self.df['passenger_count'].isna().sum()
+        self.df['passenger_count'] = self.df['passenger_count'].fillna(mean_passenger)
+
+        mean_distance = self.df['trip_distance'].mean()
+        self.df['trip_distance'] = self.df['trip_distance'].fillna(mean_distance)
+
+        mean_fare = self.df['fare_amount'].mean()
+        self.df['fare_amount'] = self.df['fare_amount'].fillna(mean_fare)
+
+        # 记录统计
+        total_deleted = sum(anomaly_stats.values())
+
+        self.removal_stats = {
+            '删除异常记录': total_deleted,
+            '填充乘客人数缺失': missing_passenger,
+            '保留比例': f"{len(self.df) / before * 100:.2f}%"
+        }
+
+        print(f"\n异常删除统计:")
+        for k, v in anomaly_stats.items():
+            if v > 0:
+                print(f"  {k}: {v:,} 条")
+        print(f"\n缺失值填充:")
+        print(f"  乘客人数: {missing_passenger:,} 条 (均值={mean_passenger:.2f})")
+        print(f"\n清洗后记录数: {len(self.df):,}")
+        print(f"保留比例: {self.removal_stats['保留比例']}")
+        print("=" * 60)
+
+        return self.df
+
+    def get_cleaned_data(self):
+        """获取清洗后的数据"""
+        return self.df
+
+    def get_removal_stats(self):
+        """获取删除统计信息"""
+
+        return self.removal_stats
+
+def main():
+    # 初始化
+    trips = pd.read_parquet('yellow_tripdata_2023-01.parquet')
+    processor = TaxiDataProcessor(trips)
+
+    # 检查和清洗
+    processor.check_data()  # 生成报告
+    processor.clean()  # 清洗数据
+
+    # 获取结果
+    trips_clean = processor.get_cleaned_data()
+
+    print(f"\n原始数据: {len(trips)} 条")
+    print(f"清洗后: {len(trips_clean)} 条")
+
+
+if __name__ == "__main__":
+    main()
