@@ -1,7 +1,13 @@
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 import os
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
@@ -692,6 +698,131 @@ class TaxiDataProcessor:
 
         return fig
 
+    def plot_speed_analysis(self):
+        """绘制平均速度因素分析图"""
+
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+
+        df = self.df
+
+        # 计算速度
+        df_valid = df[df['trip_duration_hours'] > 0.01].copy()
+        df_valid['avg_speed'] = df_valid['trip_distance'] / df_valid['trip_duration_hours']
+        # 过滤异常速度（5-60英里/小时为合理范围）
+        df_valid = df_valid[(df_valid['avg_speed'] >= 5) & (df_valid['avg_speed'] <= 60)]
+
+        print("\n" + "=" * 60)
+        print("平均速度因素分析")
+        print("=" * 60)
+
+        # ========== 1. 客流量TOP10区域 ==========
+        top10_regions = df['PULocationID'].value_counts().head(10).index.tolist()
+        print(f"\n客流量TOP10区域: {top10_regions}")
+
+        # ========== 2. 创建热力图数据 ==========
+        speed_matrix = pd.DataFrame(np.nan, index=top10_regions, columns=range(24))
+
+        for region in top10_regions:
+            for hour in range(24):
+                region_data = df_valid[(df_valid['PULocationID'] == region) & (df_valid['pickup_hour'] == hour)]
+                if len(region_data) > 0:
+                    speed_matrix.loc[region, hour] = region_data['avg_speed'].median()
+
+        # ========== 3. 创建分时段平均速度数据 ==========
+        hourly_speed = df_valid.groupby('pickup_hour')['avg_speed'].median()
+
+        # ========== 4. 绘制图表 ==========
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        fig.suptitle('平均速度因素分析', fontsize=16, fontweight='bold')
+
+        # 子图1：TOP10区域分时段平均速度热力图
+        ax1 = axes[0]
+
+        # 绘制热力图
+        sns.heatmap(speed_matrix, annot=True, fmt='.1f', cmap='RdYlGn_r',
+                    ax=ax1, square=False, linewidths=0.5,
+                    cbar_kws={'label': '平均速度 (英里/小时)'},
+                    vmin=10, vmax=30, center=20)
+
+        ax1.set_title('TOP10 客流量区域分时段平均速度热力图', fontsize=12, fontweight='bold')
+        ax1.set_xlabel('小时 (24小时制)', fontsize=10)
+        ax1.set_ylabel('区域 ID', fontsize=10)
+
+        # 修正：设置x轴刻度位置和标签
+        ax1.set_xticks(range(0, 24, 2))  # 每2小时一个刻度
+        ax1.set_xticklabels([f'{h}:00' for h in range(0, 24, 2)], rotation=45)
+        ax1.set_yticklabels([f'区域 {r}' for r in top10_regions], rotation=0)
+
+        # 标记高峰时段（17-19点）
+        for peak_hour in [17, 18]:
+            ax1.axvline(x=peak_hour + 0.5, color='blue', linestyle='-', linewidth=2, alpha=0.5)
+        ax1.text(18, len(top10_regions) - 0.5, '高峰时段\n17:00-19:00',
+                 ha='center', va='top', fontsize=9, color='blue', fontweight='bold')
+
+        # 添加颜色说明
+        ax1.text(0.02, 0.02, '红色: 拥堵 (低速)\n绿色: 畅通 (高速)',
+                 transform=ax1.transAxes, fontsize=8,
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        # 子图2：不同时间段平均速度柱状图
+        ax2 = axes[1]
+
+        # 绘制柱状图
+        hours = range(24)
+        colors = []
+        for h in hours:
+            if 17 <= h <= 18:  # 晚高峰
+                colors.append('red')
+            elif 7 <= h <= 9:  # 早高峰
+                colors.append('orange')
+            else:
+                colors.append('steelblue')
+
+        hour_values = [hourly_speed.get(h, 0) for h in hours]
+        bars = ax2.bar(hours, hour_values, color=colors, edgecolor='black', alpha=0.7)
+
+        # 添加平均线
+        avg_speed = hourly_speed.mean()
+        ax2.axhline(y=avg_speed, color='green', linestyle='--', linewidth=2, label=f'全天平均: {avg_speed:.1f} mph')
+
+        ax2.set_xlabel('小时 (24小时制)', fontsize=12)
+        ax2.set_ylabel('平均速度 (英里/小时)', fontsize=12)
+        ax2.set_title('不同时间段平均速度', fontsize=12, fontweight='bold')
+        ax2.set_xticks(range(0, 24, 2))
+        ax2.set_xticklabels([f'{h}:00' for h in range(0, 24, 2)])
+        ax2.legend(loc='upper right')
+        ax2.grid(True, alpha=0.3, axis='y')
+
+        # 添加数值标签（只标记关键点）
+        for hour in [7, 8, 9, 17, 18, 19]:
+            if hour in hourly_speed.index and not pd.isna(hourly_speed[hour]):
+                ax2.text(hour, hourly_speed[hour] + 0.5, f'{hourly_speed[hour]:.1f}',
+                         ha='center', fontsize=8)
+
+        # 添加拥堵时段标注
+        if not hourly_speed.empty:
+            slowest_hour = hourly_speed.idxmin()
+            slowest_speed = hourly_speed.min()
+            ax2.annotate(f'最拥堵时段\n{slowest_hour}:00\n{slowest_speed:.1f} mph',
+                         xy=(slowest_hour, slowest_speed),
+                         xytext=(slowest_hour + 2, slowest_speed + 3),
+                         arrowprops=dict(arrowstyle='->', color='red'),
+                         fontsize=9, color='red', ha='center')
+
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+
+        # 保存图表
+        plt.savefig('outputs/speed_analysis.png', dpi=300, bbox_inches='tight')
+        print(f"\n平均速度因素分析图已保存至: outputs/speed_analysis.png")
+        plt.show()
+
+        return fig
+
 def main():
     # 读取数据
     trips = pd.read_parquet('yellow_tripdata_2023-01.parquet')
@@ -727,6 +858,9 @@ def main():
     processor.plot_all_charts()
 
     processor.plot_fare_factors()
+
+    # 绘制平均速度因素分析图
+    processor.plot_speed_analysis()
 
     return processor
 
