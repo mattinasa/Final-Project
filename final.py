@@ -1,5 +1,11 @@
+import matplotlib.pyplot as plt
+import seaborn as sns
 import pandas as pd
+import numpy as np
+import os
 
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 class TaxiDataProcessor:
 
@@ -180,8 +186,9 @@ class TaxiDataProcessor:
         """获取删除统计信息"""
         return self.removal_stats
 
+    # 时间特征的一些提取，是否高峰的判别分为两步，一个是提取高峰时间段，在另一个函数，识别高峰在主函数
+    #额外增加的两个特征为：1.平均速度：用于评估路径情况 2.收入时间密度：用于衡量经济效益
     def extract_time_features(self):
-        """提取时间特征"""
         print("\n" + "=" * 60)
         print("提取时间特征")
         print("=" * 60)
@@ -258,6 +265,124 @@ class TaxiDataProcessor:
 
         return peak_hours
 
+    def plot_travel_demand_patterns(processor):
+        """绘制出行需求时间规律图表"""
+
+        # 设置中文字体
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        # 获取处理后的数据
+        df = processor.get_cleaned_data()
+
+        # 创建图表
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle('出行需求时间规律', fontsize=16, fontweight='bold')
+
+        # ========== 子图1：分小时平均订单量折线图 ==========
+        ax1 = axes[0]
+
+        # 统计每个小时的总订单量
+        hourly_orders = df.groupby('pickup_hour').size()
+
+        # 计算平均值作为参考线
+        avg_orders = hourly_orders.mean()
+
+        # 绘制折线图
+        hours = range(24)
+        ax1.plot(hours, [hourly_orders.get(h, 0) for h in hours],
+                 marker='o', linewidth=2, markersize=6, color='steelblue')
+
+        # 添加平均线
+        ax1.axhline(y=avg_orders, color='red', linestyle='--', linewidth=1.5,
+                    label=f'平均值: {avg_orders:,.0f}')
+
+        # 标记高峰时段
+        if hasattr(processor, 'peak_hours') and processor.peak_hours:
+            for peak_hour in processor.peak_hours:
+                ax1.axvline(x=peak_hour, color='orange', linestyle=':', alpha=0.7, linewidth=2)
+                peak_value = hourly_orders.get(peak_hour, 0)
+                ax1.scatter(peak_hour, peak_value, color='red', s=100, zorder=5)
+                ax1.annotate(f'高峰\n{peak_hour}:00',
+                             xy=(peak_hour, peak_value),
+                             xytext=(peak_hour, peak_value + max(hourly_orders) * 0.05),
+                             ha='center', fontsize=9, color='red')
+
+        # 设置图表属性
+        ax1.set_title('分小时平均订单量', fontsize=12, fontweight='bold')
+        ax1.set_xlabel('小时 (24小时制)', fontsize=10)
+        ax1.set_ylabel('订单数量', fontsize=10)
+        ax1.set_xticks(range(0, 24, 2))
+        ax1.set_xticklabels([f'{h}:00' for h in range(0, 24, 2)], rotation=45)
+        ax1.grid(True, alpha=0.3, linestyle='--')
+        ax1.legend(loc='upper right')
+
+        # 添加数值标签（可选，只标记几个关键点）
+        for hour in [7, 8, 9, 17, 18, 19] + (processor.peak_hours if hasattr(processor, 'peak_hours') else []):
+            if hour in hourly_orders.index:
+                ax1.annotate(f'{hourly_orders[hour]:,.0f}',
+                             xy=(hour, hourly_orders[hour]),
+                             xytext=(hour, hourly_orders[hour] + max(hourly_orders) * 0.01),
+                             fontsize=8, ha='center')
+
+        # ========== 子图2：分周末/工作日平均订单量柱状图 ==========
+        ax2 = axes[1]
+
+        # 创建周末/工作日标识
+        df['day_type'] = df['is_weekend'].map({0: '工作日', 1: '周末'})
+
+        # 统计周末和工作日的总订单量
+        day_type_orders = df.groupby('day_type').size()
+
+        # 确保两个类别都存在
+        categories = ['工作日', '周末']
+        values = [day_type_orders.get(cat, 0) for cat in categories]
+
+        # 绘制柱状图
+        bars = ax2.bar(categories, values, color=['steelblue', 'orange'],
+                       edgecolor='black', linewidth=1.5, alpha=0.8)
+
+        # 在柱子上方添加数值标签
+        for bar, value in zip(bars, values):
+            ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.01,
+                     f'{value:,.0f}\n({value / len(df) * 100:.1f}%)',
+                     ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+        # 计算平均每小时订单量
+        df['hour_type'] = df['pickup_hour'].astype(str) + '_' + df['day_type']
+        hourly_by_daytype = df.groupby(['pickup_hour', 'day_type']).size().unstack()
+
+        # 添加参考信息
+        weekend_avg_per_hour = df[df['is_weekend'] == 1].groupby('pickup_hour').size().mean()
+        weekday_avg_per_hour = df[df['is_weekend'] == 0].groupby('pickup_hour').size().mean()
+
+        # 设置图表属性
+        ax2.set_title('分周末/工作日平均订单量', fontsize=12, fontweight='bold')
+        ax2.set_xlabel('日期类型', fontsize=10)
+        ax2.set_ylabel('订单数量', fontsize=10)
+        ax2.grid(True, alpha=0.3, axis='y', linestyle='--')
+
+        # 添加脚注说明
+        fig.text(0.5, 0.02,
+                 f'注：工作日平均每小时 {weekday_avg_per_hour:,.0f} 单，周末平均每小时 {weekend_avg_per_hour:,.0f} 单',
+                 ha='center', fontsize=9, style='italic')
+
+        # 调整布局
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9, bottom=0.1)
+
+        # 创建目录
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+        # 保存图表
+        plt.savefig('outputs/travel_demand_patterns.png', dpi=300, bbox_inches='tight')
+
+        # 显示图表
+        plt.show()
+
+        return fig
+
+
 
 def main():
     # 读取数据
@@ -288,6 +413,8 @@ def main():
     print(
         f"高峰时段: {processor.peak_hours[0]}:00-{processor.peak_hours[0] + 1}:00 和 {processor.peak_hours[1]}:00-{processor.peak_hours[1] + 1}:00")
     print(f"\n处理完成！")
+
+    processor.plot_travel_demand_patterns()
 
     return processor
 
