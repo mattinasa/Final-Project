@@ -382,7 +382,195 @@ class TaxiDataProcessor:
 
         return fig
 
+    def plot_region_heatmap(self):
+        """绘制区域热度分析热力图"""
 
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+
+        df = self.df
+
+        # 统计 TOP 10 上车区域和下车区域
+        top_pu = df['PULocationID'].value_counts().head(10)
+        top_do = df['DOLocationID'].value_counts().head(10)
+
+        print("\n" + "=" * 60)
+        print("区域热度分析")
+        print("=" * 60)
+        print("\nTOP 10 上车区域:")
+        for i, (loc_id, count) in enumerate(top_pu.items(), 1):
+            print(f"  {i}. 区域 {loc_id}: {count:,} 单 ({count / len(df) * 100:.2f}%)")
+
+        print("\nTOP 10 下车区域:")
+        for i, (loc_id, count) in enumerate(top_do.items(), 1):
+            print(f"  {i}. 区域 {loc_id}: {count:,} 单 ({count / len(df) * 100:.2f}%)")
+
+        # 创建热力图矩阵
+        top_pu_list = top_pu.index.tolist()
+        top_do_list = top_do.index.tolist()
+
+        heatmap_data = pd.DataFrame(0, index=top_pu_list, columns=top_do_list)
+
+        for pu in top_pu_list:
+            for do in top_do_list:
+                count = len(df[(df['PULocationID'] == pu) & (df['DOLocationID'] == do)])
+                heatmap_data.loc[pu, do] = count
+
+        # 绘制图表
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        fig.suptitle('区域热度分析', fontsize=16, fontweight='bold')
+
+        # 子图1：上下客区域热力图
+        ax1 = axes[0]
+        sns.heatmap(heatmap_data, annot=True, fmt='d', cmap='YlOrRd',
+                    ax=ax1, square=True, linewidths=0.5,
+                    cbar_kws={'label': '订单数量'})
+        ax1.set_title('TOP 10 上下客区域流量热力图', fontsize=12, fontweight='bold')
+        ax1.set_xlabel('下车区域 ID', fontsize=10)
+        ax1.set_ylabel('上车区域 ID', fontsize=10)
+        ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+        ax1.set_yticklabels(ax1.get_yticklabels(), rotation=0)
+
+        # 子图2：高峰时段区域热度分析（17-19点）
+        ax2 = axes[1]
+
+        top5_pu = top_pu.head(5).index.tolist()
+        zone_hour_matrix = pd.DataFrame(0, index=top5_pu, columns=range(24))
+
+        for pu in top5_pu:
+            for hour in range(24):
+                count = len(df[(df['PULocationID'] == pu) & (df['pickup_hour'] == hour)])
+                zone_hour_matrix.loc[pu, hour] = count
+
+        sns.heatmap(zone_hour_matrix, annot=False, fmt='d', cmap='Blues',
+                    ax=ax2, cbar_kws={'label': '订单数量'},
+                    xticklabels=2, yticklabels=True)
+
+        # 标记高峰时段 17-19点
+        peak_hours = [17, 18]
+        for peak_hour in peak_hours:
+            ax2.axvline(x=peak_hour + 0.5, color='red', linestyle='-', linewidth=2, alpha=0.7)
+
+        # 添加高峰时段标注
+        ax2.text(17.5, len(top5_pu) - 0.5, '高峰时段\n17:00-19:00',
+                 ha='center', va='top', fontsize=9, color='red', fontweight='bold')
+
+        ax2.set_title('TOP 5 上车区域分时段热度', fontsize=12, fontweight='bold')
+        ax2.set_xlabel('小时 (24小时制)', fontsize=10)
+        ax2.set_ylabel('上车区域 ID', fontsize=10)
+        ax2.set_xticklabels([f'{h}:00' for h in range(0, 24, 2)], rotation=45)
+
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+        plt.savefig('outputs/region_heatmap.png', dpi=300, bbox_inches='tight')
+        print(f"\n热力图已保存至: outputs/region_heatmap.png")
+        plt.show()
+
+        return fig
+
+    def plot_top_regions_bar(self):
+        """绘制 TOP 10 区域柱状图"""
+
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+
+        df = self.df
+
+        top_pu = df['PULocationID'].value_counts().head(10)
+        top_do = df['DOLocationID'].value_counts().head(10)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle('TOP 10 区域订单量分布', fontsize=14, fontweight='bold')
+
+        # 上车区域
+        ax1 = axes[0]
+        colors = plt.cm.RdYlGn_r(np.linspace(0, 1, 10))
+        bars1 = ax1.barh(range(10), top_pu.values, color=colors)
+        ax1.set_yticks(range(10))
+        ax1.set_yticklabels([f'区域 {i}' for i in top_pu.index])
+        ax1.set_xlabel('订单数量', fontsize=10)
+        ax1.set_title('TOP 10 上车区域', fontsize=12, fontweight='bold')
+        ax1.invert_yaxis()
+
+        for i, (bar, val) in enumerate(zip(bars1, top_pu.values)):
+            ax1.text(val, bar.get_y() + bar.get_height() / 2,
+                     f'{val:,}', ha='left', va='center', fontsize=9)
+
+        # 下车区域
+        ax2 = axes[1]
+        bars2 = ax2.barh(range(10), top_do.values, color=colors)
+        ax2.set_yticks(range(10))
+        ax2.set_yticklabels([f'区域 {i}' for i in top_do.index])
+        ax2.set_xlabel('订单数量', fontsize=10)
+        ax2.set_title('TOP 10 下车区域', fontsize=12, fontweight='bold')
+        ax2.invert_yaxis()
+
+        for i, (bar, val) in enumerate(zip(bars2, top_do.values)):
+            ax2.text(val, bar.get_y() + bar.get_height() / 2,
+                     f'{val:,}', ha='left', va='center', fontsize=9)
+
+        plt.tight_layout()
+        plt.savefig('outputs/top_regions_bar.png', dpi=300, bbox_inches='tight')
+        print(f"区域柱状图已保存至: outputs/top_regions_bar.png")
+        plt.show()
+
+        return fig
+
+    def plot_peak_hour_regions(self):
+        """绘制高峰时段区域分布图（17-19点）"""
+
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+
+        df = self.df
+
+        # 高峰时段 17-19点（17, 18两个整点）
+        peak_hours = [17, 18]
+        peak_df = df[df['pickup_hour'].isin(peak_hours)]
+        peak_top_regions = peak_df['PULocationID'].value_counts().head(10)
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        colors = plt.cm.Reds(np.linspace(0.4, 0.9, 10))
+        bars = ax.bar(range(10), peak_top_regions.values, color=colors, edgecolor='black')
+
+        ax.set_xticks(range(10))
+        ax.set_xticklabels([f'区域 {i}' for i in peak_top_regions.index], rotation=45, ha='right')
+        ax.set_xlabel('区域 ID', fontsize=12)
+        ax.set_ylabel('高峰时段订单数量', fontsize=12)
+        ax.set_title(f'高峰时段 (17:00-19:00) TOP 10 上车区域',
+                     fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        for bar, val in zip(bars, peak_top_regions.values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(peak_top_regions.values) * 0.01,
+                    f'{val:,}', ha='center', va='bottom', fontsize=9)
+
+        plt.tight_layout()
+        plt.savefig('outputs/peak_hour_regions.png', dpi=300, bbox_inches='tight')
+        print(f"高峰时段区域分布图已保存至: outputs/peak_hour_regions.png")
+        plt.show()
+
+        return fig
+
+    def plot_all_charts(self):
+        """绘制所有图表"""
+        print("\n" + "=" * 60)
+        print("开始绘制图表")
+        print("=" * 60)
+        self.plot_region_heatmap()
+        self.plot_top_regions_bar()
+        self.plot_peak_hour_regions()
+        print("\n所有图表已保存至 outputs 目录")
 
 def main():
     # 读取数据
@@ -415,6 +603,8 @@ def main():
     print(f"\n处理完成！")
 
     processor.plot_travel_demand_patterns()
+
+    processor.plot_all_charts()
 
     return processor
 
