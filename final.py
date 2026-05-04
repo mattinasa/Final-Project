@@ -10,6 +10,15 @@ from tensorflow import keras
 from tensorflow.keras import layers
 import seaborn as sns
 import os
+import re
+import json
+import requests
+from datetime import datetime
+from typing import Dict, Any, Tuple, Optional
+from dotenv import load_dotenv
+
+load_dotenv()# 加载 .env 文件
+
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
@@ -1174,6 +1183,570 @@ class TaxiDataProcessor:
 
         return fig
 
+
+# ==================== 配置 ====================
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # DeepSeek API Key,出于安全性考虑，其中env文件没有上传git
+
+# 使用的大模型
+MODEL_PROVIDER = "deepseek"
+
+
+# ==================== 大模型 API 封装 ====================
+class LLMClient:
+    """大模型 API 客户端"""
+
+    def __init__(self, provider: str = "deepseek", api_key: str = None):
+        self.provider = provider
+        self.api_key = api_key
+
+        # System Prompt 设计 - 经过多轮迭代优化
+        self.system_prompt = """
+你是纽约出租车数据问答助手。你的职责是理解用户关于出租车数据的自然语言问题，
+判断问题类型并提取关键参数。
+
+## 支持的查询类型
+1. **高峰时段查询** - 用户想了解订单量最高的时段
+2. **热门区域查询** - 用户想了解客流量最大的区域
+3. **区域需求查询** - 用户想了解某个特定区域的订单量
+4. **时段需求查询** - 用户想了解某个时间段的订单情况
+5. **车费预估** - 用户想预估某段距离的车费
+6. **速度分析** - 用户想了解交通拥堵/速度情况
+7. **需求预测** - 用户想预测未来的需求
+8. **对比分析** - 用户想对比工作日和周末
+
+## 输出格式要求
+请严格按照以下JSON格式输出，不要输出其他内容：
+{
+    "intent": "查询类型",
+    "params": {"参数名": 参数值},
+    "confidence": 0.9,
+    "explanation": "对用户问题的解释说明"
+}
+
+## 参数提取规则
+- 区域ID: 查找问题中的数字，通常紧跟"区域"、"地区"等词
+- 小时: 查找问题中的数字，通常紧跟"点"、"时"等词
+- 距离: 查找问题中的数字，通常紧跟"英里"、"公里"等词
+- 数量: 查找问题中的数字，如"top10"中的10
+
+## 示例
+用户: "今天几点是高峰期？"
+输出: {"intent": "peak_hours", "params": {}, "confidence": 0.95, "explanation": "用户询问高峰时段"}
+用户: "区域236的订单量是多少？"
+输出: {"intent": "region_demand", "params": {"region_id": 236}, "confidence": 0.95, "explanation": "用户询问特定区域的订单量"}
+用户: "从曼哈顿到机场大概多少钱？"
+输出: {"intent": "fare_estimate", "params": {"distance": 15}, "confidence": 0.85, "explanation": "用户询问车费预估，假设距离15英里"}
+用户: "帮我预测一下晚上6点的需求"
+输出: {"intent": "demand_predict", "params": {"hour": 18}, "confidence": 0.9, "explanation": "用户询问需求预测"}
+"""
+
+    def call(self, user_question: str) -> Dict[str, Any]:
+        """调用大模型API"""
+        if self.provider == "deepseek":
+            return self._call_deepseek(user_question)
+        elif self.provider == "qwen":
+            return self._call_qwen(user_question)
+        elif self.provider == "glm":
+            return self._call_glm(user_question)
+        else:
+            return self._mock_call(user_question)
+
+    def _call_deepseek(self, question: str) -> Dict[str, Any]:
+        """调用 DeepSeek API"""
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": question}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 500
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                return self._parse_response(content)
+            else:
+                return self._fallback_parse(question)
+        except Exception as e:
+            print(f"API调用失败: {e}")
+            return self._fallback_parse(question)
+
+
+    def _mock_call(self, question: str) -> Dict[str, Any]:
+        """模拟API调用（用于测试，无API Key时使用）"""
+        return self._fallback_parse(question)
+
+    def _parse_response(self, content: str) -> Dict[str, Any]:
+        """解析API返回的JSON"""
+        try:
+            # 提取JSON部分
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except:
+            pass
+        return self._fallback_parse(content)
+
+    def _fallback_parse(self, text: str) -> Dict[str, Any]:
+        """回退解析方法 - 基于规则的简单解析"""
+        text_lower = text.lower()
+        result = {"intent": "unknown", "params": {}, "confidence": 0.5, "explanation": "使用规则匹配"}
+
+        # 规则匹配
+        if any(kw in text_lower for kw in ['高峰', 'peak', '最忙']):
+            result["intent"] = "peak_hours"
+        elif any(kw in text_lower for kw in ['热门', 'top', '区域排名']):
+            result["intent"] = "top_regions"
+            # 提取数字
+            nums = re.findall(r'\d+', text)
+            if nums:
+                result["params"]["number"] = int(nums[0])
+        elif any(kw in text_lower for kw in ['区域', '地区']) and '多少' in text_lower:
+            result["intent"] = "region_demand"
+            nums = re.findall(r'\d+', text)
+            if nums:
+                result["params"]["region_id"] = int(nums[0])
+        elif any(kw in text_lower for kw in ['点', '时', '小时']):
+            result["intent"] = "hour_demand"
+            nums = re.findall(r'\d+', text)
+            if nums:
+                result["params"]["hour"] = int(nums[0])
+        elif any(kw in text_lower for kw in ['钱', '费用', '价格', '车费']):
+            result["intent"] = "fare_estimate"
+            nums = re.findall(r'\d+', text)
+            if nums:
+                result["params"]["distance"] = int(nums[0])
+        elif any(kw in text_lower for kw in ['速度', '拥堵', '交通']):
+            result["intent"] = "speed_analysis"
+        elif any(kw in text_lower for kw in ['预测', '未来']):
+            result["intent"] = "demand_predict"
+        elif any(kw in text_lower for kw in ['对比', '比较', '工作日', '周末']):
+            result["intent"] = "comparison"
+
+        return result
+
+
+# ==================== 问答系统主类 ====================
+class TaxiQASystem:
+    """出租车数据问答系统 - 集成大模型API"""
+
+    def __init__(self, processor, llm_client: LLMClient):
+        self.processor = processor
+        self.df = processor.get_cleaned_data()
+        self.peak_hours = processor.peak_hours if processor.peak_hours else processor.detect_peak_hours()
+        self.llm = llm_client
+
+        # 记录对话历史
+        self.conversation_history = []
+
+        # 创建输出目录
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+
+    def process_question(self, question: str) -> Tuple[str, Optional[str]]:
+        """处理用户问题"""
+        print(f"\n🤔 用户: {question}")
+
+        # 1. 调用大模型进行意图识别
+        parsed = self.llm.call(question)
+
+        intent = parsed.get("intent", "unknown")
+        params = parsed.get("params", {})
+        confidence = parsed.get("confidence", 0.5)
+        explanation = parsed.get("explanation", "")
+
+        print(f"🤖 意图识别: {intent} (置信度: {confidence})")
+        print(f"📝 解释: {explanation}")
+
+        # 2. 根据意图调用相应函数
+        if intent == "peak_hours":
+            return self._answer_peak_hours(params)
+        elif intent == "top_regions":
+            return self._answer_top_regions(params)
+        elif intent == "region_demand":
+            return self._answer_region_demand(params)
+        elif intent == "hour_demand":
+            return self._answer_hour_demand(params)
+        elif intent == "fare_estimate":
+            return self._answer_fare_estimate(params)
+        elif intent == "speed_analysis":
+            return self._answer_speed_analysis(params)
+        elif intent == "demand_predict":
+            return self._answer_demand_predict(params)
+        elif intent == "comparison":
+            return self._answer_comparison(params)
+        else:
+            # 无法匹配的问题，使用大模型生成解释性回复
+            return self._generate_explanation(question, parsed)
+
+    def _answer_peak_hours(self, params) -> Tuple[str, Optional[str]]:
+        """回答高峰时段问题"""
+        result = f"📊 高峰时段分析\n"
+        result += f"{'=' * 40}\n"
+        result += f"订单量最高的两个时段:\n"
+        for i, hour in enumerate(self.peak_hours, 1):
+            count = self.processor.hour_counts.get(hour, 0)
+            result += f"  {i}. {hour:02d}:00 - {hour + 1:02d}:00, 订单量: {count:,} 单\n"
+
+        # 生成图表
+        self._plot_hourly_demand()
+        chart_path = 'outputs/hourly_demand.png'
+
+        return result, chart_path
+
+    def _answer_top_regions(self, params) -> Tuple[str, Optional[str]]:
+        """回答热门区域问题"""
+        top_n = params.get('number', 10)
+        top_regions = self.df['PULocationID'].value_counts().head(top_n)
+
+        result = f"📊 TOP{top_n} 热门上车区域\n"
+        result += f"{'=' * 40}\n"
+        for i, (region, count) in enumerate(top_regions.items(), 1):
+            pct = count / len(self.df) * 100
+            result += f"  {i}. 区域 {region}: {count:,} 单 ({pct:.2f}%)\n"
+
+        self._plot_top_regions(top_n)
+        chart_path = f'outputs/top_{top_n}_regions.png'
+
+        return result, chart_path
+
+    def _answer_region_demand(self, params) -> Tuple[str, Optional[str]]:
+        """回答区域需求问题"""
+        region_id = params.get('region_id') or params.get('number')
+
+        if not region_id:
+            return self._generate_explanation("需要指定区域ID", None), None
+
+        region_data = self.df[self.df['PULocationID'] == region_id]
+        demand = len(region_data)
+        pct = demand / len(self.df) * 100
+
+        hourly_demand = region_data.groupby('pickup_hour').size()
+        peak_hour = hourly_demand.idxmax() if len(hourly_demand) > 0 else None
+
+        result = f"📊 区域 {region_id} 需求分析\n"
+        result += f"{'=' * 40}\n"
+        result += f"  总订单量: {demand:,} 单\n"
+        result += f"  占总订单比例: {pct:.2f}%\n"
+        if peak_hour:
+            result += f"  高峰时段: {peak_hour:02d}:00 - {peak_hour + 1:02d}:00\n"
+
+        self._plot_region_demand(region_id)
+        chart_path = f'outputs/region_{region_id}_demand.png'
+
+        return result, chart_path
+
+    def _answer_hour_demand(self, params) -> Tuple[str, Optional[str]]:
+        """回答时段需求问题"""
+        hour = params.get('hour') or params.get('number')
+
+        if hour is None or hour < 0 or hour > 23:
+            return "请指定0-23之间的小时数。例如：8点的需求量是多少？", None
+
+        hour_data = self.df[self.df['pickup_hour'] == hour]
+        demand = len(hour_data)
+        pct = demand / len(self.df) * 100
+        is_peak = hour in self.peak_hours
+
+        result = f"📊 {hour:02d}:00 - {hour + 1:02d}:00 时段需求分析\n"
+        result += f"{'=' * 40}\n"
+        result += f"  订单量: {demand:,} 单\n"
+        result += f"  占总订单比例: {pct:.2f}%\n"
+        result += f"  {'✅ 是高峰时段' if is_peak else '❌ 不是高峰时段'}\n"
+
+        return result, None
+
+    def _answer_fare_estimate(self, params) -> Tuple[str, Optional[str]]:
+        """回答车费预估问题"""
+        distance = params.get('distance', 5)
+
+        avg_rate = self.df['fare_amount'].sum() / self.df['trip_distance'].sum()
+        estimated_fare = distance * avg_rate
+
+        result = f"📊 车费预估\n"
+        result += f"{'=' * 40}\n"
+        result += f"  预估距离: {distance} 英里\n"
+        result += f"  预估车费: ${estimated_fare:.2f}\n"
+        result += f"  (基于平均费率 ${avg_rate:.2f}/英里)\n"
+
+        return result, None
+
+    def _answer_speed_analysis(self, params) -> Tuple[str, Optional[str]]:
+        """回答速度分析问题"""
+        df_valid = self.df[self.df['trip_duration_hours'] > 0.01].copy()
+        df_valid['avg_speed'] = df_valid['trip_distance'] / df_valid['trip_duration_hours']
+        df_valid = df_valid[(df_valid['avg_speed'] >= 5) & (df_valid['avg_speed'] <= 60)]
+
+        avg_speed = df_valid['avg_speed'].mean()
+        hourly_speed = df_valid.groupby('pickup_hour')['avg_speed'].median()
+        slowest_hour = hourly_speed.idxmin()
+        slowest_speed = hourly_speed.min()
+        fastest_hour = hourly_speed.idxmax()
+        fastest_speed = hourly_speed.max()
+
+        result = f"📊 交通速度分析\n"
+        result += f"{'=' * 40}\n"
+        result += f"  全天平均速度: {avg_speed:.1f} 英里/小时\n"
+        result += f"  最拥堵时段: {slowest_hour:02d}:00, 速度 {slowest_speed:.1f} mph\n"
+        result += f"  最畅通时段: {fastest_hour:02d}:00, 速度 {fastest_speed:.1f} mph\n"
+
+        self._plot_speed_analysis()
+        chart_path = 'outputs/speed_analysis.png'
+
+        return result, chart_path
+
+    def _answer_demand_predict(self, params) -> Tuple[str, Optional[str]]:
+        """回答需求预测问题"""
+        hour = params.get('hour', 18)
+        region = params.get('region_id', None)
+
+        if region:
+            region_data = self.df[self.df['PULocationID'] == region]
+        else:
+            region_data = self.df
+
+        hourly_avg = region_data.groupby('pickup_hour').size()
+        predicted = hourly_avg.get(hour, hourly_avg.mean())
+
+        if hour in self.peak_hours:
+            predicted = predicted * 1.3
+
+        result = f"📊 需求预测\n"
+        result += f"{'=' * 40}\n"
+        if region:
+            result += f"  目标区域: {region}\n"
+        result += f"  预测时段: {hour:02d}:00 - {hour + 1:02d}:00\n"
+        result += f"  预测订单量: {int(predicted):,} 单\n"
+
+        return result, None
+
+    def _answer_comparison(self, params) -> Tuple[str, Optional[str]]:
+        """回答对比分析问题"""
+        weekday_data = self.df[self.df['is_weekend'] == 0]
+        weekend_data = self.df[self.df['is_weekend'] == 1]
+
+        weekday_avg = len(weekday_data) / weekday_data['pickup_date'].nunique()
+        weekend_avg = len(weekend_data) / weekend_data['pickup_date'].nunique()
+
+        result = f"📊 工作日 vs 周末 对比分析\n"
+        result += f"{'=' * 40}\n"
+        result += f"  工作日日均订单量: {weekday_avg:.0f} 单\n"
+        result += f"  周末日均订单量: {weekend_avg:.0f} 单\n"
+        result += f"  周末/工作日比例: {weekend_avg / weekday_avg:.2f}\n"
+
+        if weekend_avg > weekday_avg:
+            result += f"  ✅ 周末出行需求更高\n"
+        else:
+            result += f"  ✅ 工作日出行需求更高\n"
+
+        self._plot_comparison()
+        chart_path = 'outputs/weekday_weekend_comparison.png'
+
+        return result, chart_path
+
+    def _generate_explanation(self, question: str, parsed: Dict) -> Tuple[str, Optional[str]]:
+        """生成解释性回复（当无法匹配规则时）"""
+        # 这里可以再次调用大模型生成友好回复
+        intent = parsed.get("intent", "unknown")
+
+        result = f"🤔 抱歉，我无法完全理解您的问题。\n\n"
+        result += f"您的问题: \"{question}\"\n"
+        result += f"系统识别意图: {intent}\n\n"
+        result += f"我支持以下类型的问题:\n"
+        result += f"  • 高峰时段查询 (例如: 什么时候是高峰期？)\n"
+        result += f"  • 热门区域查询 (例如: TOP10热门区域有哪些？)\n"
+        result += f"  • 区域需求查询 (例如: 区域236有多少订单？)\n"
+        result += f"  • 时段需求查询 (例如: 晚上6点的订单量？)\n"
+        result += f"  • 车费预估 (例如: 5英里大概多少钱？)\n"
+        result += f"  • 速度分析 (例如: 什么时候最拥堵？)\n"
+        result += f"  • 需求预测 (例如: 预测今晚8点的需求)\n"
+        result += f"  • 对比分析 (例如: 工作日和周末哪个更忙？)\n"
+
+        return result, None
+
+    # ==================== 图表生成方法 ====================
+
+    def _plot_hourly_demand(self):
+        """绘制分小时需求图"""
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        hourly_demand = self.df.groupby('pickup_hour').size()
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        hours = range(24)
+        colors = ['red' if h in self.peak_hours else 'steelblue' for h in hours]
+        bars = ax.bar(hours, [hourly_demand.get(h, 0) for h in hours], color=colors, edgecolor='black')
+        ax.set_xlabel('小时', fontsize=12)
+        ax.set_ylabel('订单量', fontsize=12)
+        ax.set_title('分小时订单量分布', fontsize=14, fontweight='bold')
+        ax.set_xticks(range(0, 24, 2))
+        ax.grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plt.savefig('outputs/hourly_demand.png', dpi=300)
+        plt.show()
+        plt.close()
+
+    def _plot_top_regions(self, top_n):
+        """绘制TOP区域图"""
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        top_regions = self.df['PULocationID'].value_counts().head(top_n)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        colors = plt.cm.RdYlGn_r(np.linspace(0, 1, top_n))
+        bars = ax.barh(range(top_n), top_regions.values, color=colors)
+        ax.set_yticks(range(top_n))
+        ax.set_yticklabels([f'区域 {r}' for r in top_regions.index])
+        ax.set_xlabel('订单量', fontsize=12)
+        ax.set_title(f'TOP{top_n} 热门上车区域', fontsize=14, fontweight='bold')
+        ax.invert_yaxis()
+
+        plt.tight_layout()
+        plt.savefig(f'outputs/top_{top_n}_regions.png', dpi=300)
+        plt.show()
+        plt.close()
+
+    def _plot_region_demand(self, region_id):
+        """绘制区域需求图"""
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        region_data = self.df[self.df['PULocationID'] == region_id]
+        hourly_demand = region_data.groupby('pickup_hour').size()
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        hours = range(24)
+        colors = ['red' if h in self.peak_hours else 'steelblue' for h in hours]
+        bars = ax.bar(hours, [hourly_demand.get(h, 0) for h in hours], color=colors, edgecolor='black')
+        ax.set_xlabel('小时', fontsize=12)
+        ax.set_ylabel('订单量', fontsize=12)
+        ax.set_title(f'区域 {region_id} 分时段订单量', fontsize=14, fontweight='bold')
+        ax.set_xticks(range(0, 24, 2))
+        ax.grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plt.savefig(f'outputs/region_{region_id}_demand.png', dpi=300)
+        plt.show()
+        plt.close()
+
+    def _plot_speed_analysis(self):
+        """绘制速度分析图"""
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        df_valid = self.df[self.df['trip_duration_hours'] > 0.01].copy()
+        df_valid['avg_speed'] = df_valid['trip_distance'] / df_valid['trip_duration_hours']
+        df_valid = df_valid[(df_valid['avg_speed'] >= 5) & (df_valid['avg_speed'] <= 60)]
+        hourly_speed = df_valid.groupby('pickup_hour')['avg_speed'].median()
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        hours = range(24)
+        colors = ['red' if h in self.peak_hours else 'steelblue' for h in hours]
+        ax.bar(hours, [hourly_speed.get(h, 0) for h in hours], color=colors, edgecolor='black')
+        ax.set_xlabel('小时', fontsize=12)
+        ax.set_ylabel('平均速度 (英里/小时)', fontsize=12)
+        ax.set_title('分时段平均速度', fontsize=14, fontweight='bold')
+        ax.set_xticks(range(0, 24, 2))
+        ax.grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plt.savefig('outputs/speed_analysis.png', dpi=300)
+        plt.show()
+        plt.close()
+
+    def _plot_comparison(self):
+        """绘制工作日周末对比图"""
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        df_valid = self.df[self.df['trip_duration_hours'] > 0.01].copy()
+        df_valid['avg_speed'] = df_valid['trip_distance'] / df_valid['trip_duration_hours']
+
+        weekday_speed = df_valid[df_valid['is_weekend'] == 0]['avg_speed'].median()
+        weekend_speed = df_valid[df_valid['is_weekend'] == 1]['avg_speed'].median()
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        categories = ['工作日', '周末']
+        values = [weekday_speed, weekend_speed]
+        colors = ['steelblue', 'orange']
+        bars = ax.bar(categories, values, color=colors, edgecolor='black')
+        ax.set_ylabel('平均速度 (英里/小时)', fontsize=12)
+        ax.set_title('工作日 vs 周末 平均速度对比', fontsize=14, fontweight='bold')
+
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, f'{val:.1f}', ha='center', fontsize=12)
+
+        plt.tight_layout()
+        plt.savefig('outputs/weekday_weekend_comparison.png', dpi=300)
+        plt.show()
+        plt.close()
+
+
+# ==================== 命令行交互主函数 ====================
+def run_command_line_qa(processor):
+    """运行命令行问答循环"""
+
+    # 初始化大模型客户端
+    llm = LLMClient(provider=MODEL_PROVIDER, api_key=DEEPSEEK_API_KEY)
+
+    # 初始化问答系统
+    qa_system = TaxiQASystem(processor, llm)
+
+    print("\n" + "=" * 60)
+    print("🚕 纽约出租车数据问答系统")
+    print("=" * 60)
+    print("\n支持的问题类型:")
+    print("  📊 高峰时段查询 - 什么时候是高峰期？")
+    print("  📊 热门区域查询 - TOP10热门区域有哪些？")
+    print("  📊 区域需求查询 - 区域236有多少订单？")
+    print("  📊 时段需求查询 - 晚上6点的订单量？")
+    print("  📊 车费预估 - 5英里大概多少钱？")
+    print("  📊 速度分析 - 什么时候最拥堵？")
+    print("  📊 需求预测 - 预测今晚8点的需求")
+    print("  📊 对比分析 - 工作日和周末哪个更忙？")
+    print("\n💡 提示: 输入 'exit' 或 'quit' 退出系统\n")
+
+    while True:
+        try:
+            question = input("\n🔍 请输入您的问题: ").strip()
+
+            if question.lower() in ['exit', 'quit', '退出', 'q']:
+                print("\n👋 感谢使用，再见！")
+                break
+
+            if not question:
+                continue
+
+            # 处理问题
+            result, chart_path = qa_system.process_question(question)
+
+            # 输出结果
+            print("\n" + result)
+            if chart_path and os.path.exists(chart_path):
+                print(f"\n📁 图表已保存至: {chart_path}")
+
+            print("\n" + "-" * 40)
+
+        except KeyboardInterrupt:
+            print("\n\n👋 再见！")
+            break
+        except Exception as e:
+            print(f"\n❌ 处理出错: {e}")
+            continue
+
+
 def main():
     # 读取数据
     trips = pd.read_parquet('yellow_tripdata_2023-01.parquet')
@@ -1215,6 +1788,8 @@ def main():
     # 预测
     predictor = TaxiDemandPredictor(processor)
     results = predictor.run_experiment()
+
+    run_command_line_qa(processor)
 
     return processor, predictor, results
 
