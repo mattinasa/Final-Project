@@ -572,6 +572,126 @@ class TaxiDataProcessor:
         self.plot_peak_hour_regions()
         print("\n所有图表已保存至 outputs 目录")
 
+    def plot_fare_factors(self):
+        """绘制车费影响因素分析散点图"""
+
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        if not os.path.exists('outputs'):
+            os.makedirs('outputs')
+
+        df = self.df
+
+        # 采样数据（如果数据量太大，随机采样5万条以提高绘图速度）
+        if len(df) > 50000:
+            plot_df = df.sample(n=50000, random_state=42)
+            print(f"数据量较大，随机采样 50,000 条进行绘图")
+        else:
+            plot_df = df.copy()
+
+        # 创建图表
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig.suptitle('车费影响因素分析', fontsize=16, fontweight='bold')
+
+        # ========== 子图1：距离-车费散点图 ==========
+        ax1 = axes[0]
+
+        # 限制距离范围（0-50英里）使图表更清晰
+        mask_distance = (plot_df['trip_distance'] > 0) & (plot_df['trip_distance'] <= 50)
+        distance_data = plot_df[mask_distance]
+
+        ax1.scatter(distance_data['trip_distance'], distance_data['fare_amount'],
+                    alpha=0.3, s=10, c='steelblue', edgecolors='none')
+
+        # 添加趋势线
+        z = np.polyfit(distance_data['trip_distance'], distance_data['fare_amount'], 1)
+        p = np.poly1d(z)
+        x_trend = np.linspace(0, 50, 100)
+        ax1.plot(x_trend, p(x_trend), "r--", linewidth=2, label=f'趋势线 (斜率: {z[0]:.2f})')
+
+        ax1.set_xlabel('行程距离 (英里)', fontsize=12)
+        ax1.set_ylabel('车费金额 (美元)', fontsize=12)
+        ax1.set_title('距离 vs 车费', fontsize=12, fontweight='bold')
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3, linestyle='--')
+
+        # 添加相关系数
+        corr_distance = distance_data['trip_distance'].corr(distance_data['fare_amount'])
+        ax1.text(0.95, 0.05, f'相关系数: {corr_distance:.3f}',
+                 transform=ax1.transAxes, ha='right', va='bottom',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+        # ========== 子图2：时段-车费散点图 ==========
+        ax2 = axes[1]
+
+        # 添加随机抖动避免重叠
+        hour_jitter = plot_df['pickup_hour'] + np.random.normal(0, 0.15, len(plot_df))
+
+        ax2.scatter(hour_jitter, plot_df['fare_amount'],
+                    alpha=0.3, s=10, c='orange', edgecolors='none')
+
+        # 计算每个小时的平均车费
+        hourly_mean = plot_df.groupby('pickup_hour')['fare_amount'].mean()
+        ax2.plot(hourly_mean.index, hourly_mean.values, 'r-', linewidth=2, marker='o', markersize=6, label='平均车费')
+
+        # 标记高峰时段（17-19点）
+        peak_hours = [17, 18]
+        for peak_hour in peak_hours:
+            ax2.axvline(x=peak_hour, color='red', linestyle=':', alpha=0.7, linewidth=1.5)
+
+        ax2.set_xlabel('小时 (24小时制)', fontsize=12)
+        ax2.set_ylabel('车费金额 (美元)', fontsize=12)
+        ax2.set_title('时段 vs 车费', fontsize=12, fontweight='bold')
+        ax2.set_xticks(range(0, 24, 2))
+        ax2.set_xticklabels([f'{h}:00' for h in range(0, 24, 2)])
+        ax2.legend(loc='upper right')
+        ax2.grid(True, alpha=0.3, linestyle='--')
+
+        ax2.text(0.95, 0.95, '红色虚线: 高峰时段(17-19点)', transform=ax2.transAxes,
+                 ha='right', va='top', fontsize=9, color='red')
+
+        # ========== 子图3：乘客人数-车费散点图 ==========
+        ax3 = axes[2]
+
+        # 只显示1-6人
+        mask_passenger = (plot_df['passenger_count'] >= 1) & (plot_df['passenger_count'] <= 6)
+        passenger_data = plot_df[mask_passenger]
+
+        # 添加随机抖动避免重叠
+        passenger_jitter = passenger_data['passenger_count'] + np.random.normal(0, 0.08, len(passenger_data))
+
+        ax3.scatter(passenger_jitter, passenger_data['fare_amount'],
+                    alpha=0.3, s=10, c='green', edgecolors='none')
+
+        # 添加箱线图
+        passenger_data.boxplot(column='fare_amount', by='passenger_count', ax=ax3, grid=False, showfliers=False)
+
+        ax3.set_xlabel('乘客人数', fontsize=12)
+        ax3.set_ylabel('车费金额 (美元)', fontsize=12)
+        ax3.set_title('乘客人数 vs 车费', fontsize=12, fontweight='bold')
+        ax3.set_xticks(range(1, 7))
+        ax3.set_xticklabels([f'{i}人' for i in range(1, 7)])
+        ax3.grid(True, alpha=0.3, linestyle='--')
+
+        # 计算各乘客人数的平均车费
+        passenger_mean = passenger_data.groupby('passenger_count')['fare_amount'].mean()
+        for i in range(1, 7):
+            if i in passenger_mean.index:
+                ax3.scatter(i, passenger_mean[i], color='red', s=100, zorder=5, marker='D',
+                            label='平均车费' if i == 1 else '')
+        ax3.legend(loc='upper right')
+
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+
+        # 保存图表
+        plt.savefig('outputs/fare_factors_analysis.png', dpi=300, bbox_inches='tight')
+        print(f"\n车费影响因素分析图已保存至: outputs/fare_factors_analysis.png")
+        plt.show()
+
+        return fig
+
 def main():
     # 读取数据
     trips = pd.read_parquet('yellow_tripdata_2023-01.parquet')
@@ -605,6 +725,8 @@ def main():
     processor.plot_travel_demand_patterns()
 
     processor.plot_all_charts()
+
+    processor.plot_fare_factors()
 
     return processor
 
