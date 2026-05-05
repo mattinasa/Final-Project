@@ -1749,7 +1749,7 @@ def run_command_line_qa(processor):
 
 def main():
     # 读取数据
-    trips = pd.read_parquet('yellow_tripdata_2023-01.parquet')
+    trips = pd.read_parquet('data/yellow_tripdata_2023-01.parquet')
 
     # 初始化处理器
     processor = TaxiDataProcessor(trips)
